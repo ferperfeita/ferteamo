@@ -1,0 +1,1544 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+APP_DIR="$HOME/.andreznSS"
+PY_FILE="$APP_DIR/andreznSS.py"
+CMD_NAME="andreznSS"
+BIN_DIR="$PREFIX/bin"
+REPORT_DIR="$HOME/storage/downloads/ANDREZNSS_REPORTS"
+
+mkdir -p "$APP_DIR" "$REPORT_DIR" 2>/dev/null || true
+
+# Preserva rules.json, reportes y la clave HMAC entre actualizaciones.
+cat > "$PY_FILE" <<'PYCODE_ANDREZNSS'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""andreznSS 8.1 beta - scanner defensivo post-partida para Android/Free Fire."""
+
+import argparse
+import hashlib
+import hmac
+import html
+import http.server
+import ipaddress
+import json
+import os
+import re
+import shlex
+import shutil
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import zipfile
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+APP_NAME = "andreznSS"
+VERSION = "8.1-beta"
+HOME = str(Path.home())
+APP_DIR = os.path.join(HOME, ".andreznSS")
+REPORT_DIR = os.path.join(HOME, "storage", "downloads", "ANDREZNSS_REPORTS")
+LOCAL_REPORT_DIR = os.path.join(APP_DIR, "reports")
+RULES_PATH = os.path.join(APP_DIR, "rules_v8.json")
+BASELINE_PATH = os.path.join(APP_DIR, "ff_integrity_baseline_v8.json")
+KEY_PATH = os.path.join(APP_DIR, ".report_signing_key")
+DEFAULT_HOURS = 4
+MAX_VISIBLE = 18
+
+# Termux: negro + blanco brillante, sin paleta roja dominante.
+BG = "\033[40m"
+WHITE = "\033[1;97m"
+SOFT = "\033[97m"
+DIM = "\033[2;37m"
+GRAY = "\033[38;5;250m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+MEDIA_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif",
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".mp3", ".wav", ".aac", ".ogg",
+    ".pdf", ".doc", ".docx", ".ppt", ".pptx"
+}
+EXECUTABLE_OR_CONFIG_EXTENSIONS = {
+    ".apk", ".apks", ".xapk", ".dex", ".jar", ".so", ".lua", ".sh", ".py",
+    ".js", ".zip", ".rar", ".7z", ".cfg", ".conf", ".ini", ".json", ".xml"
+}
+
+DEFAULT_RULES = {
+    "free_fire_packages": ["com.dts.freefireth", "com.dts.freefiremax", "com.dts.freefire"],
+    "hook_terms": [
+        "frida-server", "re.frida.server", "gum-js-loop", "frida-gadget", "frida gadget",
+        "lsposed", "edxposed", "xposedbridge", "riru", "substrate", "objection",
+        "gameguardian", "game guardian", "androidgg"
+    ],
+    "root_terms": [
+        "magisk", "kernelsu", "ksu", "apatch", "zygisk", "shamiko", "susfs",
+        "supersu", "superuser"
+    ],
+    "explicit_cheat_terms": [
+        "aimbot", "wallhack", "magicbullet", "magic bullet", "autoheadshot", "auto headshot",
+        "modmenu", "mod menu", "replayinject", "replay injector", "replay bypass",
+        "freefirehack", "ffcheat", "antiban", "anti ban", "shaderoverlay", "shader overlay"
+    ],
+    "remote_app_terms": [
+        "anydesk", "teamviewer", "quicksupport", "rustdesk", "airdroid", "airmirror",
+        "vysor", "mobizen", "apowermirror", "splashtop", "supremo", "zohoassist",
+        "awesun", "droidvnc", "remotepc", "spacedesk", "monect"
+    ],
+    "macro_terms": [
+        "macrodroid", "autoclicker", "auto clicker", "clickmate", "keymapper", "key mapper",
+        "octopus", "mantis", "pandagamepad", "gamesir"
+    ],
+    "vpn_proxy_terms": [
+        "v2ray", "xray", "clash", "shadowsocks", "wireguard", "nekobox", "napsternet",
+        "httpcustom", "http injector", "everyproxy", "pcapdroid", "httpcanary"
+    ],
+    "hook_ports": [27042, 27043, 23946, 23947],
+    "adb_ports": [5555, 5037],
+    "remote_ports": [5900, 5901, 5938, 21115, 21116, 21117, 21118, 21119],
+    "scan_dirs": [
+        "/sdcard/Download", "/sdcard/Downloads", "/sdcard/Documents",
+        "/sdcard/Android/data", "/sdcard/Android/obb", "/sdcard/Android/media"
+    ],
+    "replay_names": ["mreplays", "mreplay", "replays", "replay"],
+    "ignored_dir_terms": [".thumbnails", "/cache/", "/.cache/", "/logs/", "andreznss_reports"],
+    "strong_archive_terms": [
+        "frida-gadget", "libfrida", "gadget.config", "xposedbridge", "libsubstrate",
+        "gameguardian", "androidgg", "replayinject", "magicbullet", "wallhack", "aimbot", "lspatch", "npatch"
+    ],
+    "dynamic_loader_terms": ["inmemorydexclassloader", "dexclassloader", "pathclassloader", "memfd", "ashmem"],
+    "suspicious_memory_terms": ["frida", "gadget", "xposed", "lsposed", "substrate", "gameguardian", "androidgg"],
+}
+
+
+def ensure_dirs():
+    os.makedirs(APP_DIR, exist_ok=True)
+    os.makedirs(LOCAL_REPORT_DIR, exist_ok=True)
+    try:
+        os.makedirs(REPORT_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def load_rules():
+    ensure_dirs()
+    rules = dict(DEFAULT_RULES)
+    if os.path.isfile(RULES_PATH):
+        try:
+            user = json.loads(Path(RULES_PATH).read_text(encoding="utf-8"))
+            if isinstance(user, dict):
+                for key, value in user.items():
+                    if key in rules and isinstance(value, type(rules[key])):
+                        rules[key] = value
+        except Exception:
+            pass
+    else:
+        try:
+            Path(RULES_PATH).write_text(json.dumps(DEFAULT_RULES, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+    return rules
+
+
+def clear_screen():
+    if sys.stdout.isatty():
+        print(BG + "\033[2J\033[H", end="")
+    else:
+        os.system("clear")
+
+
+def header(title="SCANNER POST-PARTIDA"):
+    clear_screen()
+    print(f"{WHITE}╔══════════════════════════════════════════════════════╗{RESET}")
+    print(f"{WHITE}║  andreznSS {VERSION:<10} · {title:<26}║{RESET}")
+    print(f"{WHITE}╚══════════════════════════════════════════════════════╝{RESET}")
+    print(f"{DIM}Interfaz local · análisis defensivo · solo lectura{RESET}\n")
+
+
+def status_line(label, value):
+    print(f"{WHITE}{label:<22}{RESET}{SOFT}{value}{RESET}")
+
+
+def run(cmd, timeout=12):
+    try:
+        p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+        return p.stdout.strip()
+    except Exception:
+        return ""
+
+
+def adb_available():
+    return shutil.which("adb") is not None
+
+
+def adb(args, timeout=15):
+    if not adb_available():
+        return ""
+    return run(["adb"] + list(args), timeout=timeout)
+
+
+def adb_shell(command, timeout=15):
+    if isinstance(command, str):
+        return adb(["shell", "sh", "-c", command], timeout=timeout)
+    return adb(["shell"] + list(command), timeout=timeout)
+
+
+def connected_devices():
+    out = adb(["devices"], timeout=8)
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("list of devices"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            rows.append((parts[0], parts[1]))
+    return rows
+
+
+def has_device():
+    return any(state == "device" for _, state in connected_devices())
+
+
+def _adb_result(args, timeout=20):
+    """Ejecuta ADB conservando código de salida y mensaje real para diagnóstico."""
+    if not adb_available():
+        return 127, "ADB no está instalado. Ejecuta: pkg install android-tools -y"
+    try:
+        p = subprocess.run(
+            ["adb"] + list(args),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+        return p.returncode, (p.stdout or "").strip()
+    except subprocess.TimeoutExpired:
+        return 124, "ADB agotó el tiempo de espera."
+    except Exception as exc:
+        return 126, f"No se pudo ejecutar ADB: {exc}"
+
+
+def _split_endpoint(value):
+    value = normalize(value).replace(" ", "")
+    if value.startswith("[") and "]:" in value:
+        host, port = value.rsplit(":", 1)
+        return host, port if port.isdigit() else ""
+    if ":" not in value:
+        return "", ""
+    host, port = value.rsplit(":", 1)
+    if not host or not port.isdigit():
+        return "", ""
+    try:
+        p = int(port)
+        if not 1 <= p <= 65535:
+            return "", ""
+    except ValueError:
+        return "", ""
+    return host, port
+
+
+def _loopback_endpoint(endpoint):
+    host, port = _split_endpoint(endpoint)
+    if not port:
+        return ""
+    if host in ("127.0.0.1", "localhost", "::1", "[::1]"):
+        return ""
+    return f"127.0.0.1:{port}"
+
+
+def _pair_explanation(message):
+    low = (message or "").lower()
+    if "wrong password" in low or "failed to authenticate" in low:
+        return "Código de emparejamiento incorrecto o vencido. Genera uno nuevo."
+    if "connection refused" in low:
+        return "El puerto no acepta emparejamiento. Usa el puerto que aparece dentro de 'Emparejar dispositivo con código'."
+    if "unable to connect" in low or "cannot connect" in low or "failed to connect" in low:
+        return "No se pudo alcanzar el puerto. Mantén abierta la ventana del código y verifica IP/puerto."
+    if "unknown command" in low or "usage:" in low and "pair" not in low:
+        return "La versión de ADB parece no soportar 'adb pair'. Actualiza android-tools en Termux."
+    if "protocol fault" in low:
+        return "Falló el protocolo de emparejamiento. Reinicia Depuración inalámbrica y genera un código nuevo."
+    if "timed out" in low or "tiempo de espera" in low:
+        return "El código/puerto pudo expirar o la ruta de red está bloqueada."
+    return "Revisa que Depuración inalámbrica siga activa y que el código no haya vencido."
+
+
+def pair_device():
+    header("EMPAREJAR ADB")
+
+    if not adb_available():
+        print(f"{WHITE}ADB no está instalado.{RESET}")
+        print("Ejecuta: pkg install android-tools -y")
+        input("\nEnter para continuar...")
+        return
+
+    version = adb(["version"], timeout=8).splitlines()
+    if version:
+        print(f"{DIM}{version[0]}{RESET}\n")
+
+    print(f"{WHITE}PASO 1 · EMPAREJAR{RESET}")
+    print("Android > Opciones de desarrollador > Depuración inalámbrica")
+    print("Abre: 'Emparejar dispositivo con código'.")
+    print(f"{DIM}Usa la IP:puerto de ESA ventana y su código de 6 dígitos.{RESET}\n")
+
+    pair_addr = input("IP:puerto de EMPAREJAMIENTO: ").strip()
+    code = re.sub(r"\D", "", input("Código de 6 dígitos: ").strip())
+    host, pair_port = _split_endpoint(pair_addr)
+
+    if not host or not pair_port:
+        print(f"\n{WHITE}Dirección inválida.{RESET} Ejemplo: 192.168.1.25:37123")
+        input("\nEnter para continuar...")
+        return
+    if len(code) != 6:
+        print(f"\n{WHITE}Código inválido.{RESET} Android muestra un código de 6 dígitos.")
+        input("\nEnter para continuar...")
+        return
+
+    # Reiniciar el servidor evita estados rotos de ADB en Termux.
+    _adb_result(["kill-server"], timeout=8)
+    _adb_result(["start-server"], timeout=12)
+
+    candidates = [pair_addr]
+    loopback = _loopback_endpoint(pair_addr)
+    if loopback:
+        candidates.append(loopback)
+
+    paired_at = ""
+    last_msg = ""
+    for idx, endpoint in enumerate(candidates):
+        if idx == 1:
+            print(f"{DIM}La IP directa falló; probando loopback para Termux en el mismo teléfono...{RESET}")
+        rc, msg = _adb_result(["pair", endpoint, code], timeout=25)
+        last_msg = msg
+        low = msg.lower()
+        if rc == 0 and ("successfully paired" in low or "paired to" in low or "success" in low):
+            paired_at = endpoint
+            break
+
+    if not paired_at:
+        print(f"\n{WHITE}EMPAREJAMIENTO FALLIDO{RESET}")
+        if last_msg:
+            # Mensaje real, limitado para no llenar la interfaz.
+            clean = normalize(last_msg)[:400]
+            print(f"{SOFT}{clean}{RESET}")
+        print(f"{DIM}{_pair_explanation(last_msg)}{RESET}")
+        print("\nPrueba manual para aislar el problema:")
+        print(f"  adb pair {pair_addr} {code}")
+        if loopback:
+            print(f"  adb pair {loopback} {code}")
+        input("\nEnter para continuar...")
+        return
+
+    print(f"\n{WHITE}EMPAREJAMIENTO CORRECTO{RESET}")
+    print(f"{DIM}Emparejado mediante {paired_at}{RESET}\n")
+
+    print(f"{WHITE}PASO 2 · CONECTAR{RESET}")
+    print("Vuelve a la pantalla PRINCIPAL de 'Depuración inalámbrica'.")
+    print(f"{WHITE}IMPORTANTE:{RESET} usa la IP:puerto que aparece allí.")
+    print(f"{DIM}Ese puerto normalmente NO es el mismo que el puerto de emparejamiento.{RESET}\n")
+
+    connect_addr = input("IP:puerto de CONEXIÓN: ").strip()
+    if not connect_addr:
+        print("Conexión omitida. El dispositivo quedó emparejado.")
+        input("\nEnter para continuar...")
+        return
+
+    chost, cport = _split_endpoint(connect_addr)
+    if not chost or not cport:
+        print(f"\n{WHITE}Dirección de conexión inválida.{RESET}")
+        input("\nEnter para continuar...")
+        return
+
+    connect_candidates = [connect_addr]
+    conn_loopback = _loopback_endpoint(connect_addr)
+    if conn_loopback:
+        connect_candidates.append(conn_loopback)
+
+    connected_at = ""
+    last_msg = ""
+    for idx, endpoint in enumerate(connect_candidates):
+        if idx == 1:
+            print(f"{DIM}Probando conexión por loopback para Termux en el mismo teléfono...{RESET}")
+        rc, msg = _adb_result(["connect", endpoint], timeout=20)
+        last_msg = msg
+        low = msg.lower()
+        if rc == 0 and ("connected to" in low or "already connected" in low):
+            connected_at = endpoint
+            break
+
+    if not connected_at:
+        print(f"\n{WHITE}EMPAREJADO, PERO NO CONECTADO{RESET}")
+        if last_msg:
+            print(f"{SOFT}{normalize(last_msg)[:400]}{RESET}")
+        print(f"{DIM}Comprueba el puerto de la pantalla principal de Depuración inalámbrica; no reutilices el de emparejamiento.{RESET}")
+        input("\nEnter para continuar...")
+        return
+
+    # Confirmación final mediante 'adb devices'.
+    time.sleep(0.4)
+    devices = connected_devices()
+    usable = [(serial, state) for serial, state in devices if state == "device"]
+    if usable:
+        print(f"\n{WHITE}ADB LISTO{RESET}")
+        for serial, state in usable:
+            print(f"  {serial}  ·  {state}")
+    else:
+        print(f"\n{WHITE}Conexión realizada, pero ADB aún no reporta estado 'device'.{RESET}")
+        print(adb(["devices"], timeout=8) or "Sin dispositivos visibles")
+
+    input("\nEnter para continuar...")
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def normalize(text):
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def canonical_anchor(value):
+    """Normaliza herramientas relacionadas para correlacionar fuentes sin usar tokens genéricos."""
+    low = normalize(value).lower()
+    if any(x in low for x in ("frida", "gum-js-loop", "gadget")):
+        return "frida"
+    if any(x in low for x in ("lsposed", "edxposed", "xposed", "riru")):
+        return "xposed"
+    if any(x in low for x in ("gameguardian", "game guardian", "androidgg")):
+        return "memory_editor"
+    if any(x in low for x in ("magisk", "kernelsu", "apatch", "zygisk", "shamiko", "susfs")):
+        return "root"
+    return low
+
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def sha256_file(path, max_mb=120):
+    try:
+        if os.path.getsize(path) > max_mb * 1024 * 1024:
+            return None
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def finding(category, title, verdict, severity, confidence, summary, *, source, anchor="", technical=None, points=0, direct=False, timestamp=None):
+    return {
+        "category": category,
+        "title": title,
+        "verdict": verdict,
+        "severity": severity,
+        "confidence": confidence,
+        "summary": summary,
+        "source": source,
+        "anchor": canonical_anchor(anchor),
+        "technical": technical or {},
+        "points": points,
+        "direct": bool(direct),
+        "timestamp": timestamp,
+    }
+
+
+def package_list():
+    out = adb_shell("pm list packages -3 -i 2>/dev/null", timeout=20)
+    result = []
+    for line in out.splitlines():
+        m = re.search(r"package:([^\s]+)(?:\s+installer=([^\s]+))?", line)
+        if m:
+            result.append({"package": m.group(1), "installer": m.group(2) or ""})
+    return result
+
+
+def process_list():
+    out = adb_shell("ps -A -o USER,PID,PPID,NAME,ARGS 2>/dev/null || ps -A 2>/dev/null", timeout=15)
+    return out.splitlines()
+
+
+def scan_packages_and_processes(rules):
+    findings=[]; packages=package_list(); processes=process_list()
+    package_text="\n".join(x["package"] for x in packages).lower(); process_text="\n".join(processes).lower()
+    def hits(terms,text): return sorted({t for t in terms if t.lower() in text})
+
+    active_instrumentation_terms=["frida-server","re.frida.server","gameguardian","game guardian","androidgg","objection"]
+    framework_terms=["lsposed","edxposed","xposedbridge","riru","zygisk","lspatch","npatch"]
+    active_instr=hits(active_instrumentation_terms,process_text)
+    installed_instr=hits(active_instrumentation_terms,package_text)
+    active_framework=hits(framework_terms,process_text+"\n"+package_text)
+    if active_instr:
+        findings.append(finding(
+            "inyeccion","Herramienta de instrumentación activa","ACTIVO","MEDIA","ALTA",
+            "Hay una herramienta de instrumentación o edición de memoria ejecutándose. No se atribuye a Free Fire sin otra fuente independiente.",
+            source="process",anchor=active_instr[0],points=12,direct=False,technical={"coincidencias":active_instr[:8]}
+        ))
+    elif installed_instr:
+        findings.append(finding(
+            "inyeccion","Herramienta de instrumentación instalada","INSTALADA","BAJA","MEDIA",
+            "Se detectó una herramienta de instrumentación instalada, sin prueba de que estuviera actuando sobre el juego.",
+            source="package",anchor=installed_instr[0],points=4,technical={"coincidencias":installed_instr[:8]}
+        ))
+    if active_framework:
+        findings.append(finding(
+            "integridad","Framework de hooking / parcheo presente","ENTORNO ALTERADO","BAJA","ALTA",
+            "El entorno contiene un framework capaz de aplicar hooks o parches. Su presencia no demuestra que Free Fire haya sido modificado.",
+            source="system",anchor=active_framework[0],points=5,technical={"coincidencias":active_framework[:8]}
+        ))
+
+    root_hits=hits(rules["root_terms"],package_text+"\n"+process_text)
+    if root_hits:
+        findings.append(finding("integridad","Sistema modificado / root","ENTORNO ALTERADO","BAJA","ALTA",
+            "El dispositivo muestra componentes asociados a root o modificación del sistema. Esto no prueba cheat por sí solo.",
+            source="system",anchor=root_hits[0],points=4,technical={"coincidencias":root_hits[:8]}))
+
+    remote_pkg=hits(rules["remote_app_terms"],package_text); remote_proc=hits(rules["remote_app_terms"],process_text)
+    if remote_proc:
+        findings.append(finding("control_remoto","Control remoto activo","ACTIVO","MEDIA","ALTA",
+            "Se detectó una aplicación de control remoto ejecutándose durante la revisión.",source="process",anchor=remote_proc[0],points=8,technical={"coincidencias":remote_proc[:8]}))
+    elif remote_pkg:
+        findings.append(finding("control_remoto","Aplicación de control remoto","INSTALADA","BAJA","ALTA",
+            "Hay una aplicación de control remoto instalada, pero no se confirmó que estuviera activa.",source="package",anchor=remote_pkg[0],points=2,technical={"coincidencias":remote_pkg[:8]}))
+
+    macro=hits(rules["macro_terms"],package_text+"\n"+process_text)
+    if macro:
+        active=any(t in process_text for t in macro)
+        findings.append(finding("automatizacion","Macro / mapeo externo","ACTIVO" if active else "INSTALADO","MEDIA" if active else "BAJA","MEDIA",
+            "Se encontró una herramienta de automatización o mapeo."+(" Está activa." if active else " No se confirmó uso activo."),
+            source="process" if active else "package",anchor=macro[0],points=6 if active else 2,technical={"coincidencias":macro[:8]}))
+
+    proxy=hits(rules["vpn_proxy_terms"],package_text+"\n"+process_text)
+    if proxy:
+        active=any(t in process_text for t in proxy)
+        findings.append(finding("red","Proxy / VPN","ACTIVO" if active else "INSTALADO","BAJA","MEDIA",
+            "Se detectó una herramienta de túnel, proxy o VPN. Se trata como contexto y no como prueba de cheat.",
+            source="network",anchor=proxy[0],points=2 if active else 1,technical={"coincidencias":proxy[:8]}))
+    return findings,{"packages":len(packages),"process_lines":len(processes),"process_text":process_text[:10000]}
+def parse_ss_connections(text):
+    rows = []
+    for line in text.splitlines():
+        low = line.lower()
+        if not any(k in low for k in ("estab", "listen", "syn-sent", "udp")):
+            continue
+        endpoints = re.findall(r"(?:(?:\[)?([0-9a-fA-F:.]+)(?:\])?):(\d+)", line)
+        if len(endpoints) < 1:
+            continue
+        local = endpoints[0]
+        remote = endpoints[1] if len(endpoints) > 1 else ("", "0")
+        rows.append({
+            "raw": line[:500], "local_host": local[0], "local_port": safe_int(local[1]),
+            "remote_host": remote[0], "remote_port": safe_int(remote[1]), "state": "ESTAB" if "estab" in low else "OTHER"
+        })
+    return rows
+
+
+def is_public_ip(value):
+    value = str(value or "").strip().strip("[]")
+    if not value or value in {"*", "0.0.0.0", "::", "127.0.0.1", "::1"}:
+        return False
+    try:
+        ip = ipaddress.ip_address(value.split("%", 1)[0])
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified)
+    except Exception:
+        return False
+
+
+def scan_network(rules):
+    findings = []
+    out = adb_shell("ss -tunap 2>/dev/null || netstat -tunap 2>/dev/null || cat /proc/net/tcp /proc/net/tcp6 2>/dev/null", timeout=15)
+    rows = parse_ss_connections(out)
+
+    hook_rows = [r for r in rows if r["local_port"] in rules["hook_ports"] or r["remote_port"] in rules["hook_ports"]]
+    if hook_rows:
+        findings.append(finding(
+            "inyeccion", "Puerto de instrumentación activo", "ACTIVO", "MEDIA", "ALTA",
+            "Hay un puerto asociado a instrumentación/hooking activo. No se atribuye al juego sin correlación adicional.",
+            source="network", anchor="frida", points=12, direct=False,
+            technical={"puertos": sorted({r["local_port"] or r["remote_port"] for r in hook_rows})}
+        ))
+
+    adb_rows = [r for r in rows if r["local_port"] in rules["adb_ports"] and r["state"] in ("OTHER", "ESTAB")]
+    if adb_rows:
+        findings.append(finding(
+            "depuracion", "ADB por red", "ACTIVO", "BAJA", "ALTA",
+            "La depuración ADB está escuchando o mantiene una conexión. Es contexto técnico, no una prueba de cheat.",
+            source="network", anchor="adb", points=2,
+            technical={"puertos": sorted({r["local_port"] for r in adb_rows if r["local_port"]})}
+        ))
+
+    remote_rows = [r for r in rows if r["state"] == "ESTAB" and is_public_ip(r["remote_host"])]
+
+    # Si ss/netstat expone el proceso, correlaciona el canal con la misma app remota.
+    attributed = []
+    for r in rows:
+        low = r.get("raw", "").lower()
+        term = next((t for t in rules["remote_app_terms"] if t in low), None)
+        if term and (r["state"] == "ESTAB" or r["remote_port"] in rules["remote_ports"]):
+            attributed.append((term, r))
+    if attributed:
+        term = attributed[0][0]
+        findings.append(finding(
+            "control_remoto", "Conexión de control remoto", "CONFIRMADA", "MEDIA", "ALTA",
+            "La conexión de red está asociada directamente a un proceso de control remoto visible.",
+            source="network", anchor=term, points=10,
+            technical={"cantidad": len(attributed), "puertos": sorted({r["remote_port"] or r["local_port"] for _, r in attributed if (r["remote_port"] or r["local_port"])})[:10]}
+        ))
+    else:
+        remote_port_hits = [r for r in rows if r["remote_port"] in rules["remote_ports"] or r["local_port"] in rules["remote_ports"]]
+        if remote_port_hits:
+            findings.append(finding(
+                "control_remoto", "Canal de control remoto", "POSIBLE", "BAJA", "MEDIA",
+                "Se observó un puerto compatible con control remoto, pero no pudo atribuirse a una aplicación concreta.",
+                source="network", anchor="remote-port", points=4,
+                technical={"puertos": sorted({r["remote_port"] or r["local_port"] for r in remote_port_hits})}
+            ))
+
+    if remote_rows:
+        findings.append(finding(
+            "red", "Conexiones externas", "PRESENTES", "BAJA", "ALTA",
+            f"Se observaron {len(remote_rows)} conexiones externas. Tener conexiones a Internet es normal; no se usan como prueba de cheat.",
+            source="network", anchor="internet", points=0,
+            technical={"cantidad": len(remote_rows)}
+        ))
+    return findings, {"connections_seen": len(rows), "public_connections": len(remote_rows)}
+
+
+def scan_logcat(rules, cutoff):
+    findings=[]; out=adb(["logcat","-d","-v","threadtime"],timeout=25)
+    if not out: return findings,{"available":False,"lines":0}
+    lines=out.splitlines(); direct=[]; loader=[]; ff_tokens=[p.lower() for p in rules["free_fire_packages"]]+["free fire","freefire"]
+    for line in lines[-18000:]:
+        low=line.lower()
+        if any(x in low for x in ("cameraservice","deviceinjector","requestinjector","inputdispatcher","inputreader")): continue
+        ff_context=any(t in low for t in ff_tokens)
+        hook=next((t for t in rules["hook_terms"] if t in low),None); explicit=next((t for t in rules["explicit_cheat_terms"] if t in low),None)
+        if hook or explicit:
+            direct.append({"term":hook or explicit,"line":normalize(line)[:700],"ff_context":ff_context}); continue
+        loader_term=next((t for t in rules["dynamic_loader_terms"] if t in low),None)
+        suspicious_path=any(p in low for p in ("/data/local/tmp","/sdcard/download","/storage/emulated/0/download"))
+        if loader_term and ff_context and suspicious_path: loader.append({"term":loader_term,"line":normalize(line)[:700]})
+    if direct:
+        unique=sorted({x["term"] for x in direct}); ff_direct=[x for x in direct if x["ff_context"]]
+        anchor=(ff_direct[0]["term"] if ff_direct else unique[0])
+        findings.append(finding(
+            "inyeccion","Instrumentación registrada durante la revisión","DETECTADO" if ff_direct else "REVISAR","ALTA" if ff_direct else "MEDIA","ALTA" if ff_direct else "MEDIA",
+            "El registro vincula una señal de hooking con Free Fire." if ff_direct else "El registro conserva señales de instrumentación, pero no las vincula directamente con Free Fire.",
+            source="logcat",anchor=anchor,points=18 if ff_direct else 9,direct=bool(ff_direct),technical={"coincidencias":unique[:10],"eventos":direct[:10]}))
+    if loader:
+        findings.append(finding("inyeccion","Carga dinámica anómala durante Free Fire","REVISAR","MEDIA","MEDIA",
+            "Se observó carga dinámica relacionada con el juego desde una ubicación no habitual. Es indicio técnico, no confirmación aislada.",
+            source="logcat",anchor="dynamic-loader",points=8,technical={"eventos":loader[:8]}))
+    return findings,{"available":True,"lines":len(lines),"direct_matches":len(direct),"ff_linked_matches":len([x for x in direct if x["ff_context"]]),"loader_matches":len(loader)}
+def scan_root_paths(rules):
+    paths = [
+        "/data/adb/magisk", "/data/adb/ksu", "/data/adb/ap", "/data/adb/modules",
+        "/data/local/tmp/frida-server", "/data/local/tmp/re.frida.server",
+        "/sdcard/frida-server", "/sdcard/Download/frida-server"
+    ]
+    script = " ; ".join(f"[ -e {shlex.quote(p)} ] && echo {shlex.quote(p)}" for p in paths)
+    out = adb_shell(script, timeout=12)
+    found = [x.strip() for x in out.splitlines() if x.strip().startswith("/")]
+    findings = []
+    hook = [x for x in found if "frida" in x.lower()]
+    root = [x for x in found if x not in hook]
+    if hook:
+        findings.append(finding(
+            "inyeccion", "Artefacto de instrumentación encontrado", "REVISAR", "MEDIA", "ALTA",
+            "Se encontró un artefacto conocido de instrumentación. Su presencia no confirma que haya actuado sobre Free Fire.",
+            source="filesystem", anchor="frida", points=8, direct=False,
+            technical={"cantidad": len(hook)}
+        ))
+    if root:
+        findings.append(finding(
+            "integridad", "Componentes de root", "DETECTADO", "BAJA", "ALTA",
+            "Se encontraron rutas del sistema asociadas a root/modificación. No confirma cheat por sí solo.",
+            source="filesystem", anchor="root", points=4,
+            technical={"cantidad": len(root)}
+        ))
+    return findings
+
+
+def is_ignored_file(path, rules):
+    low = path.lower().replace("\\", "/")
+    if any(term in low for term in rules["ignored_dir_terms"]):
+        return True
+    return Path(low).suffix in MEDIA_EXTENSIONS
+
+
+def local_scan_dirs(rules):
+    candidates = []
+    for path in rules["scan_dirs"]:
+        if path.startswith("/sdcard/"):
+            rel = path[len("/sdcard/"):]
+            mounted = os.path.join(HOME, "storage", "shared", rel)
+            if os.path.exists(mounted):
+                candidates.append(mounted)
+        if os.path.exists(path):
+            candidates.append(path)
+    seen = []
+    for p in candidates:
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+def inspect_local_candidate(path, rules):
+    """Static review only. Media is intentionally excluded before this function is called."""
+    result = {"archive_hits": [], "content_hits": [], "readable": False}
+    ext = Path(path).suffix.lower()
+    strong = [x.lower() for x in rules["strong_archive_terms"]]
+    try:
+        if ext in {".apk", ".zip", ".xapk", ".apks", ".jar"} and zipfile.is_zipfile(path):
+            result["readable"] = True
+            with zipfile.ZipFile(path) as z:
+                names = z.namelist()[:5000]
+                for n in names:
+                    low = n.lower()
+                    term = next((t for t in strong if t in low), None)
+                    if term:
+                        result["archive_hits"].append(term)
+                        if len(result["archive_hits"]) >= 12:
+                            break
+        elif ext in {".json", ".xml", ".cfg", ".conf", ".ini", ".lua", ".sh", ".py", ".js"}:
+            if os.path.getsize(path) <= 4 * 1024 * 1024:
+                result["readable"] = True
+                raw = Path(path).read_bytes()[:4 * 1024 * 1024]
+                text = raw.decode("utf-8", errors="ignore").lower()
+                for term in strong:
+                    if term in text:
+                        result["content_hits"].append(term)
+    except Exception:
+        pass
+    result["archive_hits"] = sorted(set(result["archive_hits"]))
+    result["content_hits"] = sorted(set(result["content_hits"]))
+    return result
+
+
+def scan_local_files(rules, cutoff):
+    findings = []
+    scanned = 0
+    strong_names = rules["explicit_cheat_terms"] + ["frida-server", "re.frida.server", "gameguardian", "androidgg"]
+    ff_terms = [p.lower() for p in rules["free_fire_packages"]]
+    for base in local_scan_dirs(rules):
+        for root, dirs, files in os.walk(base):
+            lowroot = root.lower().replace("\\", "/")
+            dirs[:] = [d for d in dirs if not any(x in (lowroot + "/" + d.lower()) for x in rules["ignored_dir_terms"])]
+            for name in files:
+                path = os.path.join(root, name)
+                scanned += 1
+                if is_ignored_file(path, rules):
+                    continue
+                ext = Path(name).suffix.lower()
+                if ext not in EXECUTABLE_OR_CONFIG_EXTENSIONS:
+                    continue
+                low = path.lower().replace("\\", "/")
+                name_hits = sorted({term for term in strong_names if term in low})
+                try:
+                    modified = datetime.fromtimestamp(os.path.getmtime(path))
+                except Exception:
+                    modified = None
+                recent = bool(modified and modified >= cutoff)
+                in_ff = any(term in low for term in ff_terms)
+                static = inspect_local_candidate(path, rules)
+                content_hits = sorted(set(static["archive_hits"] + static["content_hits"]))
+
+                # Do not report a suspicious filename alone unless it is executable/recent; content evidence is stronger.
+                if not content_hits and not (name_hits and recent and ext in {".apk", ".dex", ".jar", ".so", ".sh", ".lua"}):
+                    continue
+                points = 5
+                anchor = (content_hits or name_hits)[0]
+                if content_hits:
+                    points += 5
+                if in_ff:
+                    points += 3
+                if recent:
+                    points += 2
+                findings.append(finding(
+                    "archivo", "Archivo técnicamente compatible con modificación", "REVISAR",
+                    "MEDIA" if points < 13 else "ALTA", "MEDIA" if not content_hits else "ALTA",
+                    "La revisión interna del archivo encontró indicadores técnicos compatibles con modificación. El nombre y la ruta se mantienen fuera de la interfaz principal.",
+                    source="filesystem", anchor=anchor, points=points,
+                    technical={
+                        "extension": ext, "reciente": recent, "ruta_free_fire": in_ff,
+                        "contenido_indicadores": content_hits[:10], "nombre_indicadores": name_hits[:10],
+                        "sha256": sha256_file(path), "nombre_oculto_en_interfaz": True
+                    }
+                ))
+                if len(findings) >= 20:
+                    return findings, scanned
+    return findings, scanned
+
+def parse_epoch(value):
+    try:
+        return datetime.fromtimestamp(int(value))
+    except Exception:
+        return None
+
+
+def scan_replay(rules, cutoff):
+    findings = []
+    ffpkgs = rules["free_fire_packages"]
+    replay_names = rules["replay_names"]
+    records = []
+    replay_dirs = []
+
+    for pkg in ffpkgs:
+        roots = [f"/sdcard/Android/data/{pkg}", f"/sdcard/Android/media/{pkg}"]
+        for root in roots:
+            # Primero localiza carpetas de replay; los archivos internos pueden tener nombres aleatorios.
+            dir_expr = " -o ".join(f"-iname '*{name}*'" for name in replay_names)
+            dirs_out = adb_shell(f"find {shlex.quote(root)} -maxdepth 7 -type d \\( {dir_expr} \\) -print 2>/dev/null | head -30", timeout=12)
+            dirs = [x.strip() for x in dirs_out.splitlines() if x.strip()]
+            replay_dirs.extend(dirs)
+            for replay_dir in dirs:
+                files_out = adb_shell(f"find {shlex.quote(replay_dir)} -maxdepth 4 -type f -print 2>/dev/null | head -120", timeout=12)
+                for file_path in files_out.splitlines():
+                    file_path = file_path.strip()
+                    if not file_path:
+                        continue
+                    st = adb_shell(f"stat -c '%X|%Y|%Z|%s' {shlex.quote(file_path)} 2>/dev/null", timeout=5)
+                    parts = st.strip().split("|")
+                    if len(parts) >= 4:
+                        records.append({
+                            "atime": safe_int(parts[0]), "mtime": safe_int(parts[1]),
+                            "ctime": safe_int(parts[2]), "size": safe_int(parts[3])
+                        })
+
+    if not records:
+        return findings, {"replay_dirs": len(set(replay_dirs)), "replay_files": 0}
+
+    now = datetime.now()
+    recent_mtime = []
+    future = []
+    placed_recently_with_old_mtime = []
+    large_time_gaps = []
+    for r in records:
+        at, mt, ct = parse_epoch(r["atime"]), parse_epoch(r["mtime"]), parse_epoch(r["ctime"])
+        if mt and mt >= cutoff:
+            recent_mtime.append(r)
+        if mt and mt > now + timedelta(minutes=10):
+            future.append(r)
+        # ctime reciente + mtime claramente antiguo puede ser compatible con una copia/restauración reciente.
+        if ct and mt and ct >= cutoff and mt < cutoff - timedelta(hours=2) and (ct - mt).total_seconds() > 6 * 3600:
+            placed_recently_with_old_mtime.append(r)
+        if mt and ct and abs((ct - mt).total_seconds()) > 7 * 86400:
+            large_time_gaps.append(r)
+
+    suspicious = bool(future or placed_recently_with_old_mtime)
+    if suspicious:
+        findings.append(finding(
+            "replay", "Posible replay reemplazado", "REVISAR", "MEDIA", "MEDIA",
+            "Los metadatos muestran una copia/restauración reciente o una fecha incoherente. Es compatible con un 'pasador de replay', pero no lo confirma por sí solo.",
+            source="replay", anchor="replay", points=10,
+            technical={
+                "carpetas_replay": len(set(replay_dirs)), "archivos_replay": len(records),
+                "fecha_futura": len(future), "copiado_reciente_con_fecha_antigua": len(placed_recently_with_old_mtime),
+                "saltos_temporales_grandes": len(large_time_gaps)
+            }
+        ))
+    elif recent_mtime:
+        findings.append(finding(
+            "replay", "Replay reciente", "NORMAL / CONTEXTO", "BAJA", "ALTA",
+            "Hay actividad reciente de replay sin una anomalía material. No se marca como pasador de replay.",
+            source="replay", anchor="replay", points=0,
+            technical={"carpetas_replay": len(set(replay_dirs)), "archivos_replay": len(records), "recientes": len(recent_mtime)}
+        ))
+    return findings, {
+        "replay_dirs": len(set(replay_dirs)), "replay_files": len(records),
+        "recent": len(recent_mtime), "future": len(future),
+        "placed_recently_with_old_mtime": len(placed_recently_with_old_mtime)
+    }
+
+
+def scan_ff_integrity(rules, cutoff):
+    findings = []
+    pkgs = []
+    for pkg in rules["free_fire_packages"]:
+        path = adb_shell(f"pm path {shlex.quote(pkg)} 2>/dev/null", timeout=8)
+        if path:
+            pkgs.append(pkg)
+    if not pkgs:
+        return findings, {"installed": []}
+
+    for pkg in pkgs:
+        dump = adb_shell(f"dumpsys package {shlex.quote(pkg)} 2>/dev/null", timeout=12)
+        installer = ""
+        m = re.search(r"installerPackageName=([^\s]+)", dump)
+        if m:
+            installer = m.group(1)
+        if installer and installer not in {"com.android.vending", "com.garena.gamecenter", "com.google.android.packageinstaller", "com.android.packageinstaller"}:
+            findings.append(finding(
+                "integridad_ff", "Free Fire instalado desde origen no habitual", "REVISAR", "BAJA", "MEDIA",
+                "El instalador registrado no coincide con los orígenes habituales. Esto no demuestra APK modificado; requiere verificación adicional.",
+                source="package", anchor=pkg, points=4,
+                technical={"paquete": pkg, "instalador": installer}
+            ))
+
+        # Solo busca nombres explícitos; Unity/il2cpp/shaders normales NO se reportan.
+        roots = [f"/sdcard/Android/data/{pkg}", f"/sdcard/Android/obb/{pkg}", f"/sdcard/Android/media/{pkg}"]
+        pattern = "|".join(re.escape(x.replace(" ", "")) for x in rules["explicit_cheat_terms"] + ["frida", "gameguardian", "androidgg", "replayinject"])
+        for root in roots:
+            cmd = f"find {shlex.quote(root)} -maxdepth 7 -type f -mmin -{DEFAULT_HOURS*60} -print 2>/dev/null | grep -Evi '\\.(png|jpg|jpeg|webp|gif|mp4|mkv|mp3|wav)$' | grep -Ei '{pattern}' | head -20"
+            out = adb_shell(cmd, timeout=12)
+            if out.strip():
+                findings.append(finding(
+                    "integridad_ff", "Archivo anómalo dentro de Free Fire", "REVISAR", "MEDIA", "MEDIA",
+                    "Hay un archivo reciente dentro de la ruta oficial del juego cuyo nombre coincide con un indicador explícito de modificación. Se oculta el nombre para evitar ruido.",
+                    source="game_file", anchor=pkg, points=10,
+                    technical={"paquete": pkg, "cantidad": len([x for x in out.splitlines() if x.strip()]), "nombres_ocultos": True}
+                ))
+                break
+    return findings, {"installed": pkgs}
+
+
+def ff_running_pids(rules):
+    out = []
+    for pkg in rules["free_fire_packages"]:
+        pidout = adb_shell(f"pidof {shlex.quote(pkg)} 2>/dev/null", timeout=5)
+        for p in pidout.split():
+            if p.isdigit():
+                out.append((pkg, p))
+    return out
+
+
+def scan_memory_maps(rules):
+    targets = ff_running_pids(rules)
+    if not targets:
+        return [], {"coverage": "not_running", "targets": 0, "readable": 0}
+    findings = []
+    readable = 0
+    for pkg, pid in targets:
+        maps = adb_shell(f"cat /proc/{pid}/maps 2>/dev/null", timeout=8)
+        if not maps:
+            continue
+        readable += 1
+        low = maps.lower()
+        terms = sorted({t for t in rules["suspicious_memory_terms"] if t in low})
+        rwx_lines = [ln for ln in maps.splitlines() if re.search(r"\brwx[p-s]\b", ln)]
+        deleted_exec = [ln for ln in maps.splitlines() if "(deleted)" in ln.lower() and "x" in (ln.split()[1] if len(ln.split()) > 1 else "")]
+        memfd_exec = [ln for ln in maps.splitlines() if "memfd:" in ln.lower() and "x" in (ln.split()[1] if len(ln.split()) > 1 else "")]
+
+        if terms:
+            findings.append(finding(
+                "inyeccion", "Hooking cargado dentro de Free Fire", "DETECTADO", "ALTA", "ALTA",
+                "El mapa de memoria accesible del proceso del juego contiene una herramienta conocida de hooking o edición de memoria.",
+                source="memory", anchor=terms[0], points=22, direct=True,
+                technical={"paquete": pkg, "pid": pid, "coincidencias": terms[:8]}
+            ))
+        elif deleted_exec and memfd_exec:
+            findings.append(finding(
+                "memoria", "Memoria ejecutable anómala en Free Fire", "REVISAR", "ALTA", "MEDIA",
+                "El proceso del juego presenta memoria ejecutable temporal/eliminada que merece correlación con otras señales.",
+                source="memory", anchor="exec-anomaly", points=10,
+                technical={"paquete": pkg, "deleted_exec": len(deleted_exec), "memfd_exec": len(memfd_exec), "rwx": len(rwx_lines)}
+            ))
+        elif len(rwx_lines) >= 3:
+            findings.append(finding(
+                "memoria", "Regiones RWX en Free Fire", "CONTEXTO", "BAJA", "MEDIA",
+                "Hay regiones de memoria con lectura/escritura/ejecución simultáneas. Pueden ser legítimas (JIT), por eso no se consideran cheat aislado.",
+                source="memory", anchor="rwx", points=2,
+                technical={"paquete": pkg, "rwx": len(rwx_lines)}
+            ))
+    return findings, {"coverage": "readable" if readable else "restricted", "targets": len(targets), "readable": readable}
+
+def scan_system_environment(rules):
+    """Environment layer inspired by root/integrity scanners. Context != cheat."""
+    props_cmd = """printf 'verifiedboot='; getprop ro.boot.verifiedbootstate; printf 'device_state='; getprop ro.boot.vbmeta.device_state; printf 'flash_locked='; getprop ro.boot.flash.locked; printf 'build_tags='; getprop ro.build.tags; printf 'debuggable='; getprop ro.debuggable; printf 'secure='; getprop ro.secure; printf 'qemu='; getprop ro.kernel.qemu; printf 'fingerprint='; getprop ro.build.fingerprint"""
+    raw = adb_shell(props_cmd, timeout=10)
+    vals = {}
+    for line in raw.splitlines():
+        if '=' in line:
+            k,v=line.split('=',1); vals[k.strip()] = v.strip()
+    selinux = normalize(adb_shell("getenforce 2>/dev/null", timeout=5))
+    dev = normalize(adb_shell("settings get global development_settings_enabled 2>/dev/null", timeout=5))
+    adb_on = normalize(adb_shell("settings get global adb_enabled 2>/dev/null", timeout=5))
+    mounts = adb_shell("cat /proc/mounts 2>/dev/null | grep -Ei 'overlay|magisk|ksu|apatch' | head -30", timeout=8)
+
+    altered = []
+    if vals.get("verifiedboot", "").lower() not in {"", "green"}: altered.append("verified_boot")
+    if vals.get("device_state", "").lower() == "unlocked": altered.append("bootloader_unlocked")
+    if vals.get("flash_locked") == "0": altered.append("flash_unlocked")
+    if "test-keys" in vals.get("build_tags", "").lower(): altered.append("test_keys")
+    if vals.get("debuggable") == "1": altered.append("debuggable_build")
+    if vals.get("secure") == "0": altered.append("insecure_build")
+    if mounts.strip(): altered.append("altered_mounts")
+
+    virtualization = []
+    fp = vals.get("fingerprint", "").lower()
+    if vals.get("qemu") == "1" or any(x in fp for x in ("generic", "emulator", "sdk_gphone", "vbox", "genymotion")):
+        virtualization.append("virtualized")
+
+    findings=[]
+    if altered:
+        findings.append(finding(
+            "integridad", "Entorno Android modificado", "ENTORNO ALTERADO", "BAJA", "ALTA",
+            "El dispositivo presenta señales de bootloader/build/mounts alterados. Esto aumenta el riesgo del entorno, pero no confirma cheat.",
+            source="system", anchor="environment", points=4,
+            technical={"signals": altered, "selinux": selinux}
+        ))
+    if selinux and selinux.lower() != "enforcing":
+        findings.append(finding(
+            "integridad", "SELinux no está en modo Enforcing", "ENTORNO ALTERADO", "BAJA", "ALTA",
+            "SELinux está menos restrictivo de lo habitual. Se conserva como contexto, no como veredicto de cheat.",
+            source="system", anchor="selinux", points=2, technical={"mode": selinux}
+        ))
+    if virtualization:
+        findings.append(finding(
+            "integridad", "Entorno virtualizado / emulador", "CONTEXTO", "BAJA", "MEDIA",
+            "El sistema presenta señales compatibles con virtualización. No se considera manipulación del juego por sí sola.",
+            source="system", anchor="virtualization", points=1, technical={"signals": virtualization}
+        ))
+    return findings, {"developer_options": dev == "1", "adb_enabled": adb_on == "1", "selinux": selinux, "signals": altered, "virtualization": bool(virtualization)}
+
+
+def scan_accessibility_and_overlays(rules):
+    findings=[]
+    enabled = adb_shell("settings get secure enabled_accessibility_services 2>/dev/null", timeout=8).lower()
+    overlay = adb_shell("cmd appops query-op SYSTEM_ALERT_WINDOW allow 2>/dev/null || cmd appops query-op android:system_alert_window allow 2>/dev/null", timeout=10).lower()
+    procs = "\n".join(process_list()).lower()
+    pkgs = package_list()
+    installed = [x["package"].lower() for x in pkgs]
+
+    def matching(terms, text):
+        return sorted({t for t in terms if t in text})
+
+    remote_access = matching(rules["remote_app_terms"], enabled)
+    macro_access = matching(rules["macro_terms"], enabled)
+    remote_overlay = matching(rules["remote_app_terms"], overlay)
+    macro_overlay = matching(rules["macro_terms"], overlay)
+
+    if remote_access:
+        active = any(t in procs for t in remote_access)
+        findings.append(finding(
+            "control_remoto", "Control remoto con Accesibilidad habilitada", "ACTIVO" if active else "HABILITADO", "MEDIA", "ALTA",
+            "Una herramienta de control remoto tiene un servicio de Accesibilidad habilitado" + (" y está ejecutándose." if active else "."),
+            source="accessibility", anchor=remote_access[0], points=10 if active else 7,
+            technical={"coincidencias": remote_access[:8]}
+        ))
+    if macro_access:
+        active = any(t in procs for t in macro_access)
+        findings.append(finding(
+            "automatizacion", "Automatización con Accesibilidad habilitada", "ACTIVO" if active else "HABILITADO", "MEDIA", "ALTA",
+            "Una herramienta de macro/autoclick tiene Accesibilidad habilitada" + (" y está ejecutándose." if active else "."),
+            source="accessibility", anchor=macro_access[0], points=9 if active else 6,
+            technical={"coincidencias": macro_access[:8]}
+        ))
+    if remote_overlay:
+        findings.append(finding(
+            "control_remoto", "Control remoto con permiso de superposición", "HABILITADO", "BAJA", "ALTA",
+            "Una herramienta de control remoto puede dibujar sobre otras aplicaciones. Se exige actividad adicional para elevar el caso.",
+            source="appops", anchor=remote_overlay[0], points=4,
+            technical={"coincidencias": remote_overlay[:8]}
+        ))
+    if macro_overlay:
+        findings.append(finding(
+            "automatizacion", "Macro con permiso de superposición", "HABILITADO", "BAJA", "ALTA",
+            "Una herramienta de automatización puede dibujar sobre el juego. Este permiso solo se trata como contexto.",
+            source="appops", anchor=macro_overlay[0], points=3,
+            technical={"coincidencias": macro_overlay[:8]}
+        ))
+    return findings, {"accessibility_available": enabled not in {"", "null"}, "overlay_query_available": bool(overlay.strip())}
+
+
+def scan_unix_sockets(rules):
+    raw = adb_shell("(cat /proc/net/unix 2>/dev/null; ss -xlpn 2>/dev/null) | head -4000", timeout=12)
+    low = raw.lower()
+    findings=[]
+    hits = sorted({t for t in (rules["hook_terms"] + ["linjector", "frida-agent"]) if t in low})
+    if hits:
+        findings.append(finding(
+            "inyeccion", "Canal IPC de instrumentación activo", "ACTIVO", "MEDIA", "ALTA",
+            "Se observó un socket/canal IPC asociado a instrumentación. Se requiere correlación para atribuirlo al juego.",
+            source="socket", anchor=hits[0], points=12, direct=False,
+            technical={"coincidencias": hits[:8]}
+        ))
+    return findings, {"available": bool(raw.strip()), "matches": len(hits)}
+
+
+def load_baseline():
+    try:
+        obj=json.loads(Path(BASELINE_PATH).read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_baseline(obj):
+    try:
+        Path(BASELINE_PATH).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.chmod(BASELINE_PATH, 0o600)
+    except Exception:
+        pass
+
+
+def device_apk_fingerprint(pkg):
+    paths_out = adb_shell(f"pm path {shlex.quote(pkg)} 2>/dev/null", timeout=8)
+    paths=[ln.split(':',1)[1].strip() for ln in paths_out.splitlines() if ln.startswith('package:') and ':' in ln]
+    if not paths:
+        return None
+    dump=adb_shell(f"dumpsys package {shlex.quote(pkg)} 2>/dev/null", timeout=10)
+    vm=re.search(r"versionCode=(\d+)", dump)
+    vn=re.search(r"versionName=([^\s]+)", dump)
+    hashes=[]
+    for p in paths:
+        out=adb_shell(f"sha256sum {shlex.quote(p)} 2>/dev/null | head -1", timeout=15)
+        m=re.match(r"([0-9a-fA-F]{64})\s+", out.strip())
+        if m:
+            hashes.append((p, m.group(1).lower()))
+    if not hashes:
+        return {"version_code": vm.group(1) if vm else "", "version_name": vn.group(1) if vn else "", "digest": "", "parts": 0}
+    h=hashlib.sha256()
+    for _, digest in sorted(hashes): h.update(digest.encode('ascii'))
+    return {"version_code": vm.group(1) if vm else "", "version_name": vn.group(1) if vn else "", "digest": h.hexdigest(), "parts": len(hashes)}
+
+
+def scan_ff_baseline(rules):
+    baseline=load_baseline(); changed=False; findings=[]; stats={}
+    for pkg in rules["free_fire_packages"]:
+        fp=device_apk_fingerprint(pkg)
+        if not fp: continue
+        stats[pkg] = {"version_code": fp.get("version_code"), "parts": fp.get("parts"), "hash_available": bool(fp.get("digest"))}
+        if not fp.get("digest"): continue
+        old=baseline.get(pkg)
+        if not old or old.get("version_code") != fp.get("version_code"):
+            baseline[pkg]=fp; changed=True
+            continue
+        if old.get("digest") and not hmac.compare_digest(old["digest"], fp["digest"]):
+            findings.append(finding(
+                "integridad_ff", "Free Fire cambió respecto a su línea base local", "REVISAR", "ALTA", "ALTA",
+                "Los APK instalados cambiaron sin cambiar el versionCode registrado. Puede indicar reparación/modificación y requiere revisión manual.",
+                source="apk_hash", anchor=pkg, points=14,
+                technical={"paquete": pkg, "version_code": fp.get("version_code"), "baseline_local": True}
+            ))
+    if changed: save_baseline(baseline)
+    return findings, stats
+
+def correlate(findings):
+    """Evidence fusion: same technical family + independent sources. Context cannot bootstrap itself into a conviction."""
+    by_key=defaultdict(list)
+    for f in findings:
+        if f.get("points",0) <= 0: continue
+        by_key[(f.get("category"), f.get("anchor") or "")].append(f)
+    for (category, anchor), group in by_key.items():
+        sources={g.get("source") for g in group if g.get("source")}
+        if len(sources) < 2: continue
+        if anchor in {"", "internet", "adb", "environment", "selinux", "rwx", "virtualization"}: continue
+        # Root/integrity signals remain environmental even if multiple checks agree.
+        if category == "integridad":
+            for g in group:
+                g["confidence"]="ALTA"; g["correlated_sources"]=sorted(sources)
+            continue
+        boost = 4 if len(sources)==2 else 7
+        for g in group:
+            g["points"] += boost
+            g["confidence"]="ALTA"
+            g["correlated_sources"]=sorted(sources)
+            if category == "inyeccion" and (g.get("direct") or len(sources)>=3):
+                g["verdict"]="CORRELACIONADO"; g["severity"]="ALTA"
+            elif category in {"control_remoto", "automatizacion"} and len(sources)>=2:
+                g["verdict"]="CORRELACIONADO"
+    return findings
+
+def dedupe_and_simplify(findings):
+    # No se muestran hallazgos triviales, duplicados ni contexto de Internet común.
+    best = {}
+    for f in findings:
+        if f.get("category") == "red" and f.get("points", 0) <= 0:
+            continue
+        key = (f.get("category"), f.get("title"), f.get("anchor"))
+        prev = best.get(key)
+        if prev is None or f.get("points", 0) > prev.get("points", 0):
+            best[key] = f
+    items = list(best.values())
+    items.sort(key=lambda x: (x.get("points", 0), x.get("confidence") == "ALTA", x.get("direct")), reverse=True)
+    return items
+
+
+def overall_verdict(findings):
+    actionable=[f for f in findings if f.get("points",0)>0]
+    if not actionable: return "SIN INDICIOS RELEVANTES","No se detectaron señales materiales en la evidencia accesible."
+    injection=[f for f in actionable if f.get("category")=="inyeccion" and f.get("points",0)>=16 and (f.get("direct") or len(f.get("correlated_sources",[]))>=2)]
+    if injection: return "RIESGO ALTO","Hay evidencia dentro del juego o varias fuentes independientes coinciden en una actividad de hooking/inyección."
+    strong=[f for f in actionable if ((f.get("category") in {"memoria","integridad_ff"} and f.get("points",0)>=12) or (f.get("category")=="replay" and f.get("points",0)>=10) or (f.get("category") in {"control_remoto","automatizacion"} and f.get("points",0)>=12 and len(f.get("correlated_sources",[]))>=2) or (f.get("category")=="archivo" and f.get("points",0)>=13))]
+    if strong: return "REVISIÓN MANUAL","Hay evidencia técnica material, pero no es suficiente por sí sola para afirmar cheat."
+    return "INDICIOS DÉBILES","Solo hay señales aisladas o de contexto. No deben tratarse como confirmación de cheat."
+def progress(step, total, label):
+    width = 24
+    filled = int(width * step / max(1, total))
+    bar = "█" * filled + "░" * (width - filled)
+    pct = int(100 * step / max(1, total))
+    print(f"\r{WHITE}[{bar}] {pct:3d}%{RESET} {GRAY}{label:<32}{RESET}", end="", flush=True)
+    if step >= total:
+        print()
+
+
+def get_device_info():
+    model = adb_shell("getprop ro.product.model", timeout=5)
+    android = adb_shell("getprop ro.build.version.release", timeout=5)
+    sdk = adb_shell("getprop ro.build.version.sdk", timeout=5)
+    return {"model": normalize(model), "android": normalize(android), "sdk": normalize(sdk)}
+
+
+def build_report(player, hours):
+    rules=load_rules(); cutoff=datetime.now()-timedelta(hours=hours); all_findings=[]; stats={}; total=11; step=0
+    header("ANÁLISIS EN CURSO"); status_line("Jugador",player); status_line("Ventana",f"{hours} horas"); status_line("ADB","conectado" if has_device() else "no conectado"); print()
+    device=get_device_info() if has_device() else {}
+
+    step+=1; progress(step,total,"Procesos y aplicaciones")
+    f,s1=scan_packages_and_processes(rules) if has_device() else ([],{}); all_findings+=f; stats["apps_processes"]=s1
+
+    step+=1; progress(step,total,"Entorno Android")
+    f,s1=scan_system_environment(rules) if has_device() else ([],{}); all_findings+=f; stats["environment"]=s1
+    if has_device(): all_findings+=scan_root_paths(rules)
+
+    step+=1; progress(step,total,"Accesibilidad y overlays")
+    f,s1=scan_accessibility_and_overlays(rules) if has_device() else ([],{}); all_findings+=f; stats["accessibility"]=s1
+
+    step+=1; progress(step,total,"Memoria de Free Fire")
+    f,s1=scan_memory_maps(rules) if has_device() else ([],{}); all_findings+=f; stats["memory"]=s1
+
+    step+=1; progress(step,total,"Sockets e IPC")
+    f,s1=scan_unix_sockets(rules) if has_device() else ([],{}); all_findings+=f; stats["sockets"]=s1
+
+    step+=1; progress(step,total,"Conexiones y puertos")
+    f,s1=scan_network(rules) if has_device() else ([],{}); all_findings+=f; stats["network"]=s1
+
+    step+=1; progress(step,total,"Eventos post-partida")
+    f,s1=scan_logcat(rules,cutoff) if has_device() else ([],{}); all_findings+=f; stats["logcat"]=s1
+
+    step+=1; progress(step,total,"Integridad Free Fire")
+    f,s1=scan_ff_integrity(rules,cutoff) if has_device() else ([],{}); all_findings+=f; stats["free_fire"]=s1
+    f,s2=scan_ff_baseline(rules) if has_device() else ([],{}); all_findings+=f; stats["apk_baseline"]=s2
+
+    step+=1; progress(step,total,"Replay")
+    f,s1=scan_replay(rules,cutoff) if has_device() else ([],{}); all_findings+=f; stats["replay"]=s1
+
+    step+=1; progress(step,total,"Revisión de archivos")
+    f,scanned=scan_local_files(rules,cutoff); all_findings+=f; stats["local_files_scanned"]=scanned
+
+    step+=1; progress(step,total,"Correlación de evidencia")
+    all_findings=correlate(all_findings); all_findings=dedupe_and_simplify(all_findings); verdict,conclusion=overall_verdict(all_findings)
+    return {"scanner":{"name":APP_NAME,"version":VERSION},"generated_at":now_iso(),"player_name":player,"window_hours":hours,"device":device,
+            "summary":{"verdict":verdict,"conclusion":conclusion,"findings":len([x for x in all_findings if x.get("points",0)>0]),"high":len([x for x in all_findings if x.get("points",0)>=14])},
+            "findings":all_findings,"stats":stats}
+
+def signing_key():
+    ensure_dirs()
+    if os.path.isfile(KEY_PATH):
+        try:
+            return Path(KEY_PATH).read_bytes().strip()
+        except Exception:
+            pass
+    key = os.urandom(32).hex().encode("ascii")
+    try:
+        Path(KEY_PATH).write_bytes(key)
+        os.chmod(KEY_PATH, 0o600)
+    except Exception:
+        pass
+    return key
+
+
+def attach_integrity(report):
+    body = json.dumps(report, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    report["integrity"] = {
+        "report_id": str(uuid.uuid4()),
+        "signed_at": now_iso(),
+        "hmac_sha256": hmac.new(signing_key(), body, hashlib.sha256).hexdigest(),
+    }
+    return report
+
+
+def verify_report_file(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        integrity = data.pop("integrity", {})
+        expected = integrity.get("hmac_sha256", "")
+        body = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        actual = hmac.new(signing_key(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, actual)
+    except Exception:
+        return False
+
+
+def severity_class(f):
+    pts = f.get("points", 0)
+    if pts >= 14: return "danger"
+    if pts >= 7: return "warn"
+    return "info"
+
+
+def esc(x):
+    return html.escape(str(x if x is not None else ""))
+
+
+def category_dashboard(report):
+    categories = [
+        ("inyeccion", "Inyección / hooking"), ("memoria", "Memoria del juego"),
+        ("control_remoto", "Control remoto"), ("automatizacion", "Macros / automatización"),
+        ("replay", "Replay"), ("integridad_ff", "Integridad de Free Fire"),
+        ("integridad", "Entorno Android"), ("archivo", "Archivos revisados")
+    ]
+    out=[]
+    for key,label in categories:
+        fs=[f for f in report["findings"] if f.get("category")==key and f.get("points",0)>0]
+        if not fs:
+            out.append({"key":key,"label":label,"status":"SIN INDICIOS","level":"ok","text":"No se detectó una señal material en esta capa."})
+            continue
+        best=max(fs,key=lambda x:x.get("points",0))
+        pts=best.get("points",0)
+        if pts>=16 and (best.get("direct") or len(best.get("correlated_sources",[]))>=2): level,status="danger","DETECTADO"
+        elif pts>=8: level,status="warn","REVISAR"
+        else: level,status="info","CONTEXTO"
+        out.append({"key":key,"label":label,"status":status,"level":level,"text":best.get("summary","")})
+    return out
+
+
+def html_report(report):
+    summary=report["summary"]
+    dash=category_dashboard(report)
+    cards=[]
+    for c in dash:
+        cards.append(f"""
+        <article class="check {esc(c['level'])}">
+          <div class="check-head"><h3>{esc(c['label'])}</h3><span class="badge">{esc(c['status'])}</span></div>
+          <p>{esc(c['text'])}</p>
+        </article>""")
+    verdict_class="danger" if summary["verdict"]=="RIESGO ALTO" else "warn" if summary["verdict"]=="REVISIÓN MANUAL" else "ok"
+    memcov=report.get("stats",{}).get("memory",{}).get("coverage","unknown")
+    memlabel={"readable":"completa","restricted":"limitada por Android","not_running":"juego no estaba activo"}.get(memcov,"no disponible")
+    return f"""<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>andreznSS · Resultado</title>
+<style>
+:root{{--bg:#050505;--panel:#0d0d0d;--panel2:#121212;--text:#fff;--muted:#a9a9a9;--line:#262626;--ok:#e8e8e8;--warn:#f3cf70;--danger:#ff7373;--info:#bdbdbd}}
+*{{box-sizing:border-box}} body{{margin:0;background:linear-gradient(180deg,#0d0d0d,#050505 40%);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}}
+.wrap{{max-width:1040px;margin:auto;padding:28px 18px 64px}} .brand{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}} .brand b{{font-size:22px}} .brand span{{font-size:12px;color:var(--muted)}}
+.hero{{background:#0b0b0b;border:1px solid #292929;border-radius:24px;padding:26px;box-shadow:0 20px 70px #0008}} .hero.danger{{border-color:#713636}} .hero.warn{{border-color:#665827}} .hero.ok{{border-color:#383838}}
+.eyebrow{{font-size:11px;text-transform:uppercase;letter-spacing:1.4px;color:var(--muted)}} .hero h1{{margin:7px 0 9px;font-size:36px}} .hero p{{max-width:780px;color:#d7d7d7;line-height:1.55;margin:0}}
+.meta{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0 25px}} .meta div{{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:14px}} .meta small{{display:block;color:var(--muted);font-size:11px}} .meta b{{display:block;margin-top:5px;font-size:16px}}
+.title{{display:flex;justify-content:space-between;align-items:end;margin:24px 2px 12px}} .title h2{{font-size:20px;margin:0}} .title span{{font-size:12px;color:var(--muted)}}
+.grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}} .check{{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:17px}} .check.danger{{border-left:4px solid var(--danger)}} .check.warn{{border-left:4px solid var(--warn)}} .check.info{{border-left:4px solid #777}} .check.ok{{opacity:.78}}
+.check-head{{display:flex;align-items:center;justify-content:space-between;gap:12px}} .check h3{{margin:0;font-size:16px}} .badge{{font-size:10px;font-weight:800;letter-spacing:.5px;border:1px solid #383838;background:#171717;border-radius:99px;padding:6px 9px;white-space:nowrap}} .check p{{color:#cfcfcf;line-height:1.5;font-size:13px;margin:12px 0 0}}
+.note{{margin-top:20px;border:1px solid var(--line);background:#090909;border-radius:16px;padding:15px;color:#aaa;font-size:12px;line-height:1.5}} footer{{margin-top:24px;color:#666;font-size:11px;text-align:center}}
+@media(max-width:720px){{.grid{{grid-template-columns:1fr}}.meta{{grid-template-columns:1fr 1fr}}.hero h1{{font-size:28px}}}} @media(max-width:430px){{.meta{{grid-template-columns:1fr}}}}
+</style></head><body><main class="wrap">
+<div class="brand"><b>andreznSS</b><span>v{esc(VERSION)} · localhost</span></div>
+<section class="hero {verdict_class}"><div class="eyebrow">Veredicto general</div><h1>{esc(summary['verdict'])}</h1><p>{esc(summary['conclusion'])}</p></section>
+<section class="meta"><div><small>Jugador</small><b>{esc(report['player_name'])}</b></div><div><small>Ventana</small><b>{report['window_hours']} h</b></div><div><small>Hallazgos</small><b>{summary['findings']}</b></div><div><small>Cobertura memoria</small><b>{esc(memlabel)}</b></div></section>
+<div class="title"><h2>Veredictos por capa</h2><span>Sin rutas, nombres raros ni volcados técnicos</span></div>
+<section class="grid">{''.join(cards)}</section>
+<div class="note">Root, bootloader, VPN, ADB, Developer Options o una app instalada no confirman cheat por sí solos. Los detalles forenses completos quedan únicamente en el JSON firmado.</div>
+<footer>andreznSS · análisis defensivo post-partida · localhost 127.0.0.1</footer>
+</main></body></html>"""
+
+def text_report(report):
+    lines = [
+        f"andreznSS {VERSION}", f"Jugador: {report['player_name']}", f"Fecha: {report['generated_at']}",
+        f"VEREDICTO: {report['summary']['verdict']}", report['summary']['conclusion'], "", "RESULTADOS:"
+    ]
+    for f in report["findings"][:MAX_VISIBLE]:
+        if f.get("points", 0) <= 0:
+            continue
+        lines += [f"- {f['title']}: {f['verdict']}", f"  {f['summary']}", f"  Confianza: {f['confidence']} | Severidad: {f['severity']}"]
+    return "\n".join(lines) + "\n"
+
+
+def save_report(report):
+    ensure_dirs()
+    report = attach_integrity(report)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_player = re.sub(r"[^a-zA-Z0-9_-]+", "_", report["player_name"])[:50] or "sin_nombre"
+    out_dir = REPORT_DIR if os.path.isdir(os.path.dirname(REPORT_DIR)) else LOCAL_REPORT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.join(out_dir, f"{safe_player}_{stamp}")
+    json_path, txt_path, html_path = base + ".json", base + ".txt", base + ".html"
+    Path(json_path).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    Path(txt_path).write_text(text_report(report), encoding="utf-8")
+    Path(html_path).write_text(html_report(report), encoding="utf-8")
+    return txt_path, json_path, html_path
+
+
+class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+
+def start_server(html_path):
+    directory = os.path.dirname(html_path)
+    filename = os.path.basename(html_path)
+    handler = lambda *args, **kwargs: QuietHandler(*args, directory=directory, **kwargs)
+    for port in range(8765, 8786):
+        try:
+            server = socketserver.TCPServer(("127.0.0.1", port), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            return server, f"http://127.0.0.1:{port}/{filename}"
+        except OSError:
+            continue
+    return None, ""
+
+
+def open_url(url):
+    opener = shutil.which("termux-open-url")
+    if opener and url:
+        subprocess.run([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def run_scan(nick=None):
+    if not adb_available():
+        header("ADB NO DISPONIBLE")
+        print("Instala android-tools con: pkg install android-tools -y")
+        input("\nEnter para continuar...")
+        return
+    if not has_device():
+        header("ADB NO CONECTADO")
+        print("Empareja el teléfono desde la opción [0].")
+        input("\nEnter para continuar...")
+        return
+    if nick is None:
+        header("NUEVO ANÁLISIS")
+        nick = input("Nombre o nick del jugador: ").strip() or "sin_nombre"
+    report = build_report(nick, DEFAULT_HOURS)
+    txt_path, json_path, html_path = save_report(report)
+    server, url = start_server(html_path)
+    header("RESULTADO")
+    print(f"{WHITE}{report['summary']['verdict']}{RESET}")
+    print(f"{SOFT}{report['summary']['conclusion']}{RESET}\n")
+    status_line("Hallazgos", report["summary"]["findings"])
+    status_line("Reporte", txt_path)
+    if server:
+        status_line("Localhost", url)
+        open_url(url)
+    try:
+        input("\nEnter para cerrar el visor y volver al menú...")
+    finally:
+        if server:
+            server.shutdown(); server.server_close()
+
+
+def verify_screen():
+    header("VERIFICAR REPORTE")
+    path = input("Ruta del archivo JSON: ").strip()
+    ok = verify_report_file(path)
+    print(f"\n{WHITE}{'ÍNTEGRO' if ok else 'NO VÁLIDO / MODIFICADO'}{RESET}")
+    input("\nEnter para continuar...")
+
+
+def create_bugreport():
+    header("BUGREPORT ANDROID")
+    if not has_device():
+        print("ADB no está conectado.")
+        input("\nEnter para continuar...")
+        return
+    ensure_dirs()
+    out_dir = REPORT_DIR if os.path.isdir(os.path.dirname(REPORT_DIR)) else LOCAL_REPORT_DIR
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    target = os.path.join(out_dir, f"andreznSS_bugreport_{stamp}.zip")
+    print("Generando BugReport con ADB...")
+    result = run(["adb", "bugreport", target], timeout=180)
+    print(result[-1500:] if result else "Comando finalizado.")
+    print(f"\nDestino: {target}")
+    input("\nEnter para continuar...")
+
+
+def save_technical_dump():
+    header("DIAGNÓSTICO TÉCNICO")
+    if not has_device():
+        print("ADB no está conectado.")
+        input("\nEnter para continuar...")
+        return
+    ensure_dirs()
+    out_dir = REPORT_DIR if os.path.isdir(os.path.dirname(REPORT_DIR)) else LOCAL_REPORT_DIR
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    target = os.path.join(out_dir, f"andreznSS_diagnostico_{stamp}.txt")
+    sections = [
+        ("DEVICE", "getprop"),
+        ("PACKAGES", "pm list packages -3 -i"),
+        ("PROCESSES", "ps -A -o USER,PID,PPID,NAME,ARGS 2>/dev/null || ps -A"),
+        ("NETWORK", "ss -tunap 2>/dev/null || netstat -tunap 2>/dev/null"),
+        ("CONNECTIVITY", "dumpsys connectivity 2>/dev/null"),
+        ("ACCESSIBILITY", "settings get secure enabled_accessibility_services 2>/dev/null"),
+        ("APP_OPS_OVERLAY", "cmd appops query-op SYSTEM_ALERT_WINDOW allow 2>/dev/null"),
+        ("UNIX_SOCKETS", "cat /proc/net/unix 2>/dev/null"),
+        ("SELINUX_MOUNTS", "getenforce 2>/dev/null; cat /proc/mounts 2>/dev/null | grep -Ei 'overlay|magisk|ksu|apatch'"),
+        ("LOGCAT", "logcat -d -v threadtime -t 3500 2>/dev/null"),
+    ]
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(f"andreznSS {VERSION} · diagnóstico solo lectura · {now_iso()}\n")
+        for title, cmd in sections:
+            f.write(f"\n===== {title} =====\n")
+            f.write(adb_shell(cmd, timeout=35))
+            f.write("\n")
+    print(f"Guardado en: {target}")
+    input("\nEnter para continuar...")
+
+
+def menu():
+    while True:
+        header()
+        status_line("ADB", "conectado" if has_device() else "sin conexión")
+        print(f"\n{WHITE}[0]{RESET} Emparejar / conectar ADB")
+        print(f"{WHITE}[1]{RESET} Iniciar análisis")
+        print(f"{WHITE}[2]{RESET} Verificar integridad de reporte")
+        print(f"{WHITE}[3]{RESET} Crear BugReport manual")
+        print(f"{WHITE}[4]{RESET} Guardar diagnóstico técnico")
+        print(f"{WHITE}[5]{RESET} Salir\n")
+        choice = input("Selecciona: ").strip()
+        if choice == "0": pair_device()
+        elif choice == "1": run_scan()
+        elif choice == "2": verify_screen()
+        elif choice == "3": create_bugreport()
+        elif choice == "4": save_technical_dump()
+        elif choice == "5": break
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="andreznSS")
+    p.add_argument("--nick")
+    p.add_argument("--scan", action="store_true")
+    return p.parse_args()
+
+
+def main():
+    ensure_dirs()
+    args = parse_args()
+    if args.scan or args.nick:
+        run_scan(args.nick)
+    else:
+        menu()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCancelado.")
+PYCODE_ANDREZNSS
+
+chmod +x "$PY_FILE"
+mkdir -p "$BIN_DIR"
+cat > "$BIN_DIR/$CMD_NAME" <<EOF2
+#!/data/data/com.termux/files/usr/bin/bash
+python "$PY_FILE" "\$@"
+EOF2
+chmod +x "$BIN_DIR/$CMD_NAME"
+
+clear 2>/dev/null || true
+printf '\033[40m\033[2J\033[H'
+printf '\033[1;97m╔════════════════════════════════════════════╗\033[0m\n'
+printf '\033[1;97m║  andreznSS 8.0 beta · INSTALADO           ║\033[0m\n'
+printf '\033[1;97m╚════════════════════════════════════════════╝\033[0m\n'
+printf '\033[97mConfiguración y clave de reportes preservadas.\033[0m\n\n'
+python "$PY_FILE" "$@"
